@@ -7,8 +7,10 @@ import io
 import datetime
 
 # Read the Parquet files
-raw_rates = pd.read_parquet("../../fed_yield_curve.parquet")  
-cds_spread = pl.read_parquet("../../markit_cds.parquet")  
+raw_rates = pd.read_parquet("fed_yield_curve.parquet")  
+cds_spread = pl.read_parquet("markit_cds.parquet")  
+cds_spread_2 = pl.read_parquet("markit_cds_subsetted_to_crsp.parquet")
+cds_spread_3 = pl.read_parquet("markit_red_crsp_link.parquet")
 
 def process_rates(raw_rates, start_date, end_date):
     """
@@ -127,7 +129,7 @@ def calc_discount(df, start_date, end_date):
 
     return quarterly_discount
 
-def get_portfolio_dict(start_date = "2003-01-01", end_date = "2023-01-01", cds_spread = None, display_checks = False):
+def get_portfolio_dict(start_date = "2003-01-01", end_date = "2023-01-01", cds_spread = None):
     if isinstance(start_date, str):
         start_date = datetime.datetime.strptime(start_date, "%Y-%m-%d")
     if isinstance(end_date, str):
@@ -136,30 +138,15 @@ def get_portfolio_dict(start_date = "2003-01-01", end_date = "2023-01-01", cds_s
     filtered_cds_spread = cds_spread.filter(
         (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
     )
-
+    filtered_cds_spread_us_only = filtered_cds_spread.filter(pl.col("country") == "United States")
     # **Data Cleaning and Preparation**
-    cds_spread_noNA = filtered_cds_spread.drop_nulls(subset=["parspread"])
+    cds_spread_noNA = filtered_cds_spread_us_only.drop_nulls(subset=["parspread"])
     cds_spread_noNA = cds_spread_noNA.drop(['convspreard', 'year', 'redcode'])
-    if display_checks:
-    # Check for duplicates
-        num_all_duplicates = cds_spread_noNA.shape[0] - cds_spread_noNA.unique().shape[0]
-        print(num_all_duplicates)
-
-        # Identify duplicated rows
-        duplicated_rows = cds_spread_noNA.join(
-            cds_spread_noNA.group_by(cds_spread_noNA.columns).agg(pl.count()).filter(pl.col("count") > 1).select(cds_spread_noNA.columns),
-            on=cds_spread_noNA.columns,
-            how="inner"
-        )
-        print(duplicated_rows)
-
-        print("Number of par spreads greater than 100%: ", len(cds_spread_unique.filter(pl.col("parspread") > 1)))
-        print("Number of par spreads greater than 1000%: ", len(cds_spread_unique.filter(pl.col("parspread") > 10)))
-        print("Parspreads greater than 1000%: ", cds_spread_unique.filter(pl.col("parspread") > 10))
 
 
     # Remove duplicates
     cds_spread_unique = cds_spread_noNA.unique()
+    cds_spread_unique = cds_spread_unique.filter(pl.col("parspread") <= 0.5)
 
     # Convert date column to year-month format
     cds_spread_unique = cds_spread_unique.with_columns(
@@ -224,26 +211,11 @@ def get_portfolio_dict(start_date = "2003-01-01", end_date = "2023-01-01", cds_s
         .agg(pl.col("parspread").mean().alias("rep_parspread"))
     )
 
-    parspread_mean = rep_parspread_df["rep_parspread"].mean()
-
-    # Replace outliers in 'rep_parspread' (values > 10) with the mean of 'parspread'
-    rep_parspread_df_fixed = rep_parspread_df.with_columns(
-        pl.when(pl.col("rep_parspread") > 10)
-        .then(parspread_mean)  # Replace outliers with parspread mean
-        .otherwise(pl.col("rep_parspread"))
-        .alias("rep_parspread")
-    )
-
 
     # Convert 'date' column to month level (truncate to the first day of the month)
-    rep_parspread_df_fixed = rep_parspread_df_fixed.with_columns(
+    rep_parspread_df = rep_parspread_df.with_columns(
         pl.col("date").dt.truncate("1mo").alias("month")
     )
-
-    # # Aggregate the monthly mean rep_parspread per tenor
-    # monthly_df = rep_parspread_df_fixed.group_by(["month", "tenor"]).agg(
-    #     pl.col("rep_parspread").mean().alias("monthly_rep_parspread")
-    # )
 
     portfolio_dict = {}
 
@@ -252,7 +224,7 @@ def get_portfolio_dict(start_date = "2003-01-01", end_date = "2023-01-01", cds_s
             key = f"{tenor}_Q{quantile}"  # Example key: "5Y_Q3"
             
             # Filter dataframe for this specific tenor-quantile pair
-            portfolio_df = rep_parspread_df_fixed.filter(
+            portfolio_df = rep_parspread_df.filter(
                 (pl.col("tenor") == tenor) & (pl.col("credit_quantile") == quantile)
             )
 
@@ -286,6 +258,30 @@ def calc_cds_return_for_portfolios(portfolio_dict, raw_rates, start_date = "2003
     # Storage for results
     cds_return_dict = {}
 
+    fiveY_lambda_dict = {}
+
+    for key, portfolio_df in portfolio_dict.items():
+        if key.startswith("5Y_Q"):
+            print(f"Calculating lambda for 5Y quintile: {key}")
+
+            # Ensure pivot_table is structured correctly in Polars
+            pivot_table = (
+                portfolio_df.pivot(index="date", columns="tenor", values="rep_parspread")
+                .sort("date")
+            )
+
+            # Check if the 5Y tenor exists
+            if "5Y" in pivot_table.columns:
+                # Extract the entire 5Y tenor spread as a DataFrame
+                spread_5Y_df = pivot_table.select(pl.col("5Y"))
+
+                # Compute lambda using the He-Kelly formula
+                loss_given_default = 0.6
+                lambda_df = 4 * np.log(1 + (spread_5Y_df / (4 * loss_given_default)))
+
+                # Store the entire lambda DataFrame for the quintile
+                fiveY_lambda_dict[key] = lambda_df
+
     # Iterate over each portfolio in portfolio_dict
     for key, portfolio_df in portfolio_dict.items():
         print(f"Processing portfolio: {key}")
@@ -299,8 +295,9 @@ def calc_cds_return_for_portfolios(portfolio_dict, raw_rates, start_date = "2003
         pivot_table = pivot_table.rename({col: f"{key}" for col in pivot_table.columns if col != "date"})
         # Compute lambda using He-Kelly formula
         loss_given_default = 0.6
-        lambda_df = 4 * np.log(1 + (pivot_table.select(pl.exclude("date")) / (4 * loss_given_default)))
-
+        quintile_number = key.split("_Q")[-1]
+        vol_target_key = f"5Y_Q{quintile_number}"
+        lambda_constant = fiveY_lambda_dict.get(vol_target_key, None)
         # Define quarters
         quarters = np.arange(0.25, 20.25, 0.25)
 
@@ -310,7 +307,7 @@ def calc_cds_return_for_portfolios(portfolio_dict, raw_rates, start_date = "2003
         survival_probs = pl.DataFrame(
             {"date": pivot_table["date"]}
         ).with_columns([
-            pl.lit(np.exp(-q * lambda_df.flatten())).alias(str(q)) for q in quarters
+            pl.lit(np.exp(-q * lambda_constant.flatten())).alias(str(q)) for q in quarters
         ])
 
         # Convert Pandas-based discount factors into Polars before filtering
@@ -357,6 +354,8 @@ def calc_cds_return_for_portfolios(portfolio_dict, raw_rates, start_date = "2003
             (cds_spread_shifted / 250) + (cds_spread_change * risky_duration_shifted.select("sum"))
         ).drop_nulls()
 
+        # Compute standard deviation of this return series
+
         # Select the "date" column and shift it to exclude the first row
         date_column = risky_duration.select("date").slice(1)
 
@@ -370,6 +369,24 @@ def calc_cds_return_for_portfolios(portfolio_dict, raw_rates, start_date = "2003
 
 def calculate_monthly_returns(daily_returns_dict):
     monthly_returns_dict = {}
+    fiveY_vol_dict = {}
+    for key, df in daily_returns_dict.items():
+        # Check if the portfolio key corresponds to a 5Y quintile
+        if key.startswith("5Y_Q"):
+            # Ensure 'date' column is in datetime format and truncate to the first day of the month
+            df = df.with_columns(pl.col("date").dt.truncate("1mo").alias("Month"))
+
+            # Calculate monthly returns
+            monthly_returns = (
+                df.group_by("Month")
+                .agg(
+                    (pl.col(key) + 1).product() - 1  # Aggregate to compute monthly returns
+                ).rename({f"{key}": "Monthly Return"})  # Rename column
+            )
+
+            # Calculate the volatility of monthly returns
+            vol = monthly_returns.select("Monthly Return").std().item()
+            fiveY_vol_dict[key] = vol
 
     for key, df in daily_returns_dict.items():
         # Ensure 'date' column is in datetime format and truncate to the first day of the month
@@ -377,15 +394,30 @@ def calculate_monthly_returns(daily_returns_dict):
 
         # Compute monthly returns 
         monthly_returns = (
-    df.group_by("Month")
-    .agg(
-        (pl.col(key) + 1).product() - 1  # Directly apply product aggregation
-    ).rename({f"{key}": "Monthly Return"})  # Rename column
-)
+            df.group_by("Month")
+            .agg(
+                (pl.col(key) + 1).product() - 1  # Directly apply product aggregation
+            ).rename({f"{key}": "Monthly Return"})  # Rename column
+        )
+
+        # Calculate monthly volatility of the portfolio
+        portfolio_std = monthly_returns.select("Monthly Return").std().item()
+
+        # Identify the corresponding 5Y quintile for volatility scaling
+        vol_target_key = "5Y_Q" + key.split("_Q")[-1]
+        target_std = fiveY_vol_dict.get(vol_target_key, None)
+
+        # Scale the monthly returns 
+        if target_std is not None and portfolio_std > 0:
+            scale_factor = target_std / portfolio_std
+            
+            # Scale the monthly returns
+            monthly_returns = monthly_returns.with_columns(
+                (pl.col("Monthly Return") * scale_factor).alias("Scaled Monthly Return")
+            )
 
         # Store in the dictionary with the same key
         monthly_returns_dict[key] = monthly_returns
-
     return monthly_returns_dict
 
 
@@ -398,7 +430,7 @@ if __name__ == "__main__":
     cds_returns =calc_cds_return_for_portfolios(portfolio_dict, raw_rates, start_date, end_date)
     monthly_returns_dict = calculate_monthly_returns(cds_returns)
 
-    output_file = "returns_data_0322.xlsx"
+    output_file = "returns_data_0329_v7.xlsx"
 
     # Create an Excel writer
     with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
